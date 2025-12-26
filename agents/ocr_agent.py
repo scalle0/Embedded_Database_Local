@@ -115,86 +115,97 @@ class OCRAgent(BaseAgent):
     def _init_gemini(self):
         """Initialize Google Gemini API."""
         try:
-            import google.generativeai as genai
+            from google import genai
 
             gemini_config = self.config.get('gemini', {})
             api_key = gemini_config.get('api_key')
 
             if not api_key or api_key.startswith('${'):
                 self.logger.warning("Gemini API key not configured. Gemini fallback disabled.")
-                self.gemini = None
+                self.gemini_client = None
                 return
 
-            genai.configure(api_key=api_key)
-            model_name = gemini_config.get('model_name', 'gemini-2.0-flash-exp')
-            self.gemini = genai.GenerativeModel(model_name)
-            self.logger.info(f"Gemini initialized with model: {model_name}")
+            # Initialize client with new SDK
+            self.gemini_client = genai.Client(api_key=api_key)
+            self.gemini_model_name = gemini_config.get('model_name', 'gemini-2.0-flash-exp')
+            self.logger.info(f"Gemini initialized with model: {self.gemini_model_name}")
 
         except ImportError:
-            self.logger.warning("google-generativeai not available. Install with: pip install google-generativeai")
-            self.gemini = None
+            self.logger.warning("google-genai not available. Install with: pip install google-genai")
+            self.gemini_client = None
         except Exception as e:
             self.logger.error(f"Failed to initialize Gemini: {e}")
-            self.gemini = None
+            self.gemini_client = None
 
     def process(self, doc: DocumentData) -> DocumentData:
-        """Extract text from image using OCR.
+        """Extract text from image or PDF using OCR.
 
         Args:
-            doc: DocumentData with image in raw_data
+            doc: DocumentData with image in raw_data or PDF requiring OCR
 
         Returns:
             DocumentData with extracted text in content field
         """
-        if doc.file_type not in {'png', 'jpg', 'jpeg', 'tiff', 'bmp', 'image'}:
-            self.log_skip(f"{doc.file_path.name}: Not an image file")
+        # Check if this is a PDF that needs OCR
+        is_pdf_ocr = doc.file_type == 'pdf' and doc.metadata.get('requires_ocr', False)
+
+        # Check if this is a regular image file
+        is_image = doc.file_type in {'png', 'jpg', 'jpeg', 'tiff', 'bmp', 'image'}
+
+        if not is_image and not is_pdf_ocr:
+            self.log_skip(f"{doc.file_path.name}: Not an image file or PDF requiring OCR")
             return doc
 
         if doc.raw_data is None:
-            self.log_error(f"{doc.file_path.name}: No image data available")
+            self.log_error(f"{doc.file_path.name}: No data available")
             doc.processing_status = 'failed'
-            doc.errors.append("No image data")
+            doc.errors.append("No data")
             return doc
 
         try:
-            # Load image
-            image = Image.open(io.BytesIO(doc.raw_data))
+            # Handle PDF OCR
+            if is_pdf_ocr:
+                text, confidence = self._ocr_pdf(doc)
+            else:
+                # Handle regular image OCR
+                # Load image
+                image = Image.open(io.BytesIO(doc.raw_data))
 
-            # Preprocess image
-            image = self._preprocess_image(image)
+                # Preprocess image
+                image = self._preprocess_image(image)
 
-            # Try local OCR first
-            text, confidence = self._local_ocr(image)
+                # Try local OCR first
+                text, confidence = self._local_ocr(image)
 
-            # AI fallback chain if confidence is low
-            if confidence < self.claude_threshold:
-                # Try Claude first (better for handwriting)
-                if self.claude:
-                    self.logger.info(
-                        f"{doc.file_path.name}: Local OCR confidence {confidence:.1f}% < {self.claude_threshold}%, "
-                        "using Claude fallback"
-                    )
-                    try:
-                        text = self._claude_ocr(image)
-                        confidence = 95.0  # Claude doesn't provide confidence, assume high
-                        doc.metadata['ocr_method'] = 'claude'
-                    except Exception as e:
-                        self.logger.warning(f"Claude OCR failed: {e}, trying Gemini")
-                        # Fall through to Gemini if Claude fails
-                        if self.gemini and self.gemini_as_backup:
-                            text = self._gemini_ocr(image)
-                            confidence = 90.0
-                            doc.metadata['ocr_method'] = 'gemini_backup'
+                # AI fallback chain if confidence is low
+                if confidence < self.claude_threshold:
+                    # Try Claude first (better for handwriting)
+                    if self.claude:
+                        self.logger.info(
+                            f"{doc.file_path.name}: Local OCR confidence {confidence:.1f}% < {self.claude_threshold}%, "
+                            "using Claude fallback"
+                        )
+                        try:
+                            text = self._claude_ocr(image)
+                            confidence = 95.0  # Claude doesn't provide confidence, assume high
+                            doc.metadata['ocr_method'] = 'claude'
+                        except Exception as e:
+                            self.logger.warning(f"Claude OCR failed: {e}, trying Gemini")
+                            # Fall through to Gemini if Claude fails
+                            if self.gemini_client and self.gemini_as_backup:
+                                text = self._gemini_ocr(image)
+                                confidence = 90.0
+                                doc.metadata['ocr_method'] = 'gemini_backup'
 
-                # If Claude not available, use Gemini directly
-                elif self.gemini and not self.gemini_as_backup:
-                    self.logger.info(
-                        f"{doc.file_path.name}: Local OCR confidence {confidence:.1f}% < {self.gemini_threshold}%, "
-                        "using Gemini fallback"
-                    )
-                    text = self._gemini_ocr(image)
-                    confidence = 90.0
-                    doc.metadata['ocr_method'] = 'gemini'
+                    # If Claude not available, use Gemini directly
+                    elif self.gemini_client and not self.gemini_as_backup:
+                        self.logger.info(
+                            f"{doc.file_path.name}: Local OCR confidence {confidence:.1f}% < {self.gemini_threshold}%, "
+                            "using Gemini fallback"
+                        )
+                        text = self._gemini_ocr(image)
+                        confidence = 90.0
+                        doc.metadata['ocr_method'] = 'gemini'
 
             doc.content = text
             doc.ocr_confidence = confidence
@@ -251,6 +262,96 @@ class OCRAgent(BaseAgent):
         except Exception as e:
             self.logger.warning(f"Image preprocessing failed: {e}, using original")
             return image
+
+    def _ocr_pdf(self, doc: DocumentData) -> Tuple[str, float]:
+        """Convert PDF pages to images and perform OCR.
+
+        Args:
+            doc: DocumentData with PDF that requires OCR
+
+        Returns:
+            Tuple of (extracted_text, confidence_score)
+        """
+        try:
+            import fitz  # PyMuPDF
+
+            # Open PDF from raw data
+            pdf = fitz.open(stream=doc.raw_data, filetype="pdf")
+
+            all_text = []
+            all_confidences = []
+
+            self.logger.info(f"Processing {len(pdf)} pages from {doc.file_path.name} with OCR")
+
+            for page_num, page in enumerate(pdf, start=1):
+                # Render page to image (higher DPI for better OCR)
+                # 300 DPI is good for OCR, but can be adjusted
+                dpi = 300
+                zoom = dpi / 72  # PDF default is 72 DPI
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat)
+
+                # Convert PyMuPDF pixmap to PIL Image
+                img_data = pix.tobytes("png")
+                image = Image.open(io.BytesIO(img_data))
+
+                # Preprocess image
+                image = self._preprocess_image(image)
+
+                # Perform OCR on this page
+                text, confidence = self._local_ocr(image)
+
+                # AI fallback chain if confidence is low
+                if confidence < self.claude_threshold:
+                    if self.claude:
+                        self.logger.info(
+                            f"Page {page_num}: Local OCR confidence {confidence:.1f}% < {self.claude_threshold}%, "
+                            "using Claude fallback"
+                        )
+                        try:
+                            text = self._claude_ocr(image)
+                            confidence = 95.0
+                            doc.metadata['ocr_method'] = 'claude'
+                        except Exception as e:
+                            self.logger.warning(f"Claude OCR failed on page {page_num}: {e}, trying Gemini")
+                            if self.gemini_client and self.gemini_as_backup:
+                                text = self._gemini_ocr(image)
+                                confidence = 90.0
+                                doc.metadata['ocr_method'] = 'gemini_backup'
+
+                    elif self.gemini_client and not self.gemini_as_backup:
+                        self.logger.info(
+                            f"Page {page_num}: Local OCR confidence {confidence:.1f}% < {self.gemini_threshold}%, "
+                            "using Gemini fallback"
+                        )
+                        text = self._gemini_ocr(image)
+                        confidence = 90.0
+                        doc.metadata['ocr_method'] = 'gemini'
+
+                if text.strip():
+                    all_text.append(text)
+                    all_confidences.append(confidence)
+                    self.logger.debug(f"Page {page_num}: {len(text)} chars, confidence: {confidence:.1f}%")
+
+            pdf.close()
+
+            # Combine all pages
+            combined_text = '\n\n'.join(all_text)
+            avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
+
+            self.logger.info(
+                f"PDF OCR complete: {len(all_text)} pages processed, "
+                f"{len(combined_text)} total chars, avg confidence: {avg_confidence:.1f}%"
+            )
+
+            return combined_text, avg_confidence
+
+        except ImportError:
+            self.logger.error("PyMuPDF (fitz) not available. Install with: pip install PyMuPDF")
+            raise RuntimeError("PyMuPDF required for PDF OCR")
+        except Exception as e:
+            self.logger.error(f"PDF OCR failed: {e}")
+            raise
 
     def _local_ocr(self, image: Image.Image) -> Tuple[str, float]:
         """Perform OCR using local engines.
@@ -382,20 +483,26 @@ class OCRAgent(BaseAgent):
         Returns:
             Extracted text
         """
-        if not self.gemini:
+        if not self.gemini_client:
             raise RuntimeError("Gemini not initialized")
 
         try:
-            # Convert PIL Image to format Gemini accepts
+            import base64
+
+            # Convert PIL Image to base64 for new SDK
             img_byte_arr = io.BytesIO()
             image.save(img_byte_arr, format='PNG')
             img_byte_arr.seek(0)
+            img_b64 = base64.b64encode(img_byte_arr.read()).decode('utf-8')
 
-            # Generate content
-            response = self.gemini.generate_content([
-                self.gemini_prompt,
-                image
-            ])
+            # Generate content with new SDK
+            response = self.gemini_client.models.generate_content(
+                model=self.gemini_model_name,
+                contents=[
+                    self.gemini_prompt,
+                    {"mime_type": "image/png", "data": img_b64}
+                ]
+            )
 
             text = response.text.strip()
             self.logger.debug(f"Gemini OCR: {len(text)} chars extracted")
@@ -416,7 +523,10 @@ class OCRAgent(BaseAgent):
         """
         processed = []
         for doc in documents:
+            # Process images and PDFs that require OCR
             if doc.file_type in {'png', 'jpg', 'jpeg', 'tiff', 'bmp', 'image'}:
+                processed.append(self.process(doc))
+            elif doc.file_type == 'pdf' and doc.metadata.get('requires_ocr', False):
                 processed.append(self.process(doc))
             else:
                 processed.append(doc)

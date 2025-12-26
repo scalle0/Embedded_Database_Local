@@ -125,9 +125,11 @@ class IngestionAgent(BaseAgent):
         # Extract basic metadata
         metadata = self._extract_metadata(file_path, file_hash if self.skip_duplicates else None)
 
-        # Load raw data for images and PDFs
+        # Load raw data for files that need binary reading
+        # (images, PDFs, and Office documents)
         raw_data = None
-        if file_ext in {'.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.pdf'}:
+        if file_ext in {'.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.pdf',
+                        '.docx', '.doc', '.msg', '.eml'}:
             try:
                 with open(file_path, 'rb') as f:
                     raw_data = f.read()

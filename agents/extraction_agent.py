@@ -93,7 +93,7 @@ class ExtractionAgent(BaseAgent):
                 doc = self._extract_enex(doc)
             elif doc.file_type in {'eml', 'msg'}:
                 doc = self._extract_email(doc)
-            elif doc.file_type in {'txt', 'md'}:
+            elif doc.file_type in {'txt', 'md', 'text'}:
                 doc = self._extract_text(doc)
             else:
                 self.log_skip(f"{doc.file_path.name}: Unsupported format for text extraction")

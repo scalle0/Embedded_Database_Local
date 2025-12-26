@@ -126,14 +126,15 @@ class EmbeddingAgent(BaseAgent):
     def _init_gemini_embeddings(self):
         """Initialize Gemini embeddings API."""
         try:
-            import google.generativeai as genai
+            from google import genai
 
             api_key = self.gemini_config.get('api_key')
 
             if not api_key or api_key.startswith('${'):
                 raise ValueError("Gemini API key not configured")
 
-            genai.configure(api_key=api_key)
+            # Initialize client with new SDK
+            self.genai_client = genai.Client(api_key=api_key)
 
             # Get embedding model
             self.embedding_model_name = self.gemini_config.get(
@@ -142,12 +143,11 @@ class EmbeddingAgent(BaseAgent):
             )
 
             self.logger.info(f"Gemini embeddings initialized: {self.embedding_model_name}")
-            self.genai = genai
 
         except ImportError:
             raise RuntimeError(
-                "google-generativeai not available. "
-                "Install with: pip install google-generativeai"
+                "google-genai not available. "
+                "Install with: pip install google-genai"
             )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize Gemini embeddings: {e}")
@@ -352,19 +352,14 @@ class EmbeddingAgent(BaseAgent):
 
                 for retry in range(max_retries):
                     try:
-                        # Call Gemini API
-                        result = self.genai.embed_content(
+                        # Call Gemini API with new SDK
+                        response = self.genai_client.models.embed_content(
                             model=self.embedding_model_name,
-                            content=uncached_texts,
-                            task_type="retrieval_document"
+                            contents=uncached_texts
                         )
 
-                        # Extract embeddings
-                        new_embeddings = result['embedding'] if len(uncached_texts) == 1 else result['embedding']
-
-                        # Handle single vs batch response
-                        if len(uncached_texts) == 1:
-                            new_embeddings = [new_embeddings]
+                        # Extract embeddings from new API response
+                        new_embeddings = [embedding.values for embedding in response.embeddings]
 
                         # Cache and insert embeddings
                         for text, embedding, idx in zip(uncached_texts, new_embeddings, uncached_indices):

@@ -6,7 +6,7 @@ pyyaml>=6.0.1
 chromadb>=0.4.22
 
 # AI APIs
-google-generativeai>=0.3.2  # Gemini for embeddings and OCR fallback
+google-genai>=1.0.0  # Gemini for embeddings and OCR fallback (new SDK)
 anthropic>=0.39.0  # Claude for primary OCR fallback
 
 # OCR engines

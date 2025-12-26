@@ -8,6 +8,15 @@ gemini:
   max_retries: 3
   timeout: 60
 
+claude:
+  api_key: ${ANTHROPIC_API_KEY}  # Set via environment variable
+  model_name: "claude-opus-4-5-20251101"  # Latest and most capable model (Nov 2024)
+  # Alternative: "claude-sonnet-4-5-20250929" (faster, cheaper)
+  # Alternative: "claude-haiku-4-5-20251001" (fastest, cheapest)
+  max_tokens: 4096
+  max_retries: 3
+  timeout: 60
+
 # OCR Configuration
 ocr:
   # Primary OCR engines (local)
@@ -22,10 +31,17 @@ ocr:
     gpu: false  # Set to true if you have CUDA GPU
     confidence_threshold: 70
 
-  # Gemini fallback for difficult handwriting
+  # AI-powered fallback for difficult handwriting
+  # Fallback chain: Local OCR → Claude → Gemini
+  claude_fallback:
+    enabled: true
+    use_when_confidence_below: 70
+    prompt: "Extract all text from this image, including handwritten text. Preserve the original layout and structure. If any text is unclear or illegible, indicate it with [unclear]. Be thorough and accurate."
+
   gemini_fallback:
     enabled: true
     use_when_confidence_below: 70
+    use_as_backup: true  # Only if Claude also fails
     prompt: "Extract all text from this image, including handwritten text. Preserve layout and structure. If text is unclear, indicate with [unclear]."
 
 # Text Extraction

@@ -1,6 +1,6 @@
 # Multi-Agent Document Processing & Embedding System
 
-A comprehensive document processing pipeline that ingests various file formats, extracts text using OCR and parsers, generates embeddings via Google Gemini, and stores them in a ChromaDB vector database for semantic search.
+A comprehensive document processing pipeline that ingests various file formats, extracts text using OCR and parsers, generates embeddings via AI models (Gemini/Claude), and stores them in a ChromaDB vector database for semantic search.
 
 ## Features
 
@@ -13,17 +13,26 @@ A comprehensive document processing pipeline that ingests various file formats, 
 ### 🤖 Multi-Agent Architecture
 
 1. **Ingestion Agent** - Discovers and validates files, handles duplicates
-2. **OCR Agent** - Hybrid approach with Tesseract, EasyOCR, and Gemini fallback
+2. **OCR Agent** - Multi-provider approach with local engines and AI fallbacks
 3. **Extraction Agent** - Extracts text from PDFs, DOCX, emails, ENEX
 4. **Embedding Agent** - Smart chunking and Gemini embeddings generation
 5. **Database Agent** - ChromaDB vector storage and retrieval
 6. **Orchestrator** - Coordinates the entire pipeline
 
-### 🔍 OCR Strategy
+### 🔍 OCR Strategy (Multi-Provider Fallback)
 
-- **Local First**: Uses Tesseract and EasyOCR for standard typed text
-- **Confidence-Based Fallback**: If OCR confidence < 70%, uses Gemini Vision API
-- **Optimized for Handwriting**: EasyOCR handles handwritten text, with Gemini as backup
+**Intelligent fallback chain for optimal text extraction**:
+
+1. **Tesseract** (local, fast) → Free, works for most typed text
+2. **EasyOCR** (local) → Better for complex layouts
+3. **Claude Opus 4.5** ⭐ NEW → Best for handwriting and difficult scans
+4. **Gemini Vision** → Backup AI fallback
+
+- **Cost Optimized**: Only uses AI when local OCR confidence < 70%
+- **Best Quality**: Claude Opus 4.5 excels at handwritten text
+- **Flexible**: Choose between Opus (best), Sonnet (balanced), or Haiku (fast)
+
+See [MULTI_PROVIDER_OCR.md](MULTI_PROVIDER_OCR.md) for detailed configuration
 
 ### 💾 Vector Database
 
@@ -86,13 +95,19 @@ Create a `.env` file (copy from `.env.example`):
 cp .env.example .env
 ```
 
-Edit `.env` and add your Gemini API key:
+Edit `.env` and add your API keys:
 
-```
+```bash
+# Required for embeddings
 GEMINI_API_KEY=your_gemini_api_key_here
+
+# Recommended for best OCR results
+ANTHROPIC_API_KEY=your_anthropic_api_key_here
 ```
 
-**Get a Gemini API key**: https://makersuite.google.com/app/apikey
+**Get API keys**:
+- **Gemini API** (required): https://makersuite.google.com/app/apikey
+- **Anthropic API** (optional): https://console.anthropic.com/
 
 ### 4. Configure Settings (Optional)
 

@@ -26,15 +26,26 @@ class OCRAgent(BaseAgent):
         self._init_tesseract()
         self._init_easyocr()
 
-        # Gemini fallback configuration
+        # Claude fallback configuration
+        self.use_claude_fallback = self.ocr_config.get('claude_fallback', {}).get('enabled', True)
+        self.claude_threshold = self.ocr_config.get('claude_fallback', {}).get('use_when_confidence_below', 70)
+        self.claude_prompt = self.ocr_config.get('claude_fallback', {}).get(
+            'prompt',
+            'Extract all text from this image, including handwritten text. Preserve the original layout and structure.'
+        )
+
+        # Gemini fallback configuration (backup for Claude)
         self.use_gemini_fallback = self.ocr_config.get('gemini_fallback', {}).get('enabled', True)
         self.gemini_threshold = self.ocr_config.get('gemini_fallback', {}).get('use_when_confidence_below', 70)
+        self.gemini_as_backup = self.ocr_config.get('gemini_fallback', {}).get('use_as_backup', True)
         self.gemini_prompt = self.ocr_config.get('gemini_fallback', {}).get(
             'prompt',
             'Extract all text from this image, including handwritten text.'
         )
 
-        # Initialize Gemini if enabled
+        # Initialize AI fallbacks
+        if self.use_claude_fallback:
+            self._init_claude()
         if self.use_gemini_fallback:
             self._init_gemini()
 
@@ -75,6 +86,31 @@ class OCRAgent(BaseAgent):
         except Exception as e:
             self.logger.error(f"Failed to initialize EasyOCR: {e}")
             self.easyocr = None
+
+    def _init_claude(self):
+        """Initialize Anthropic Claude API."""
+        try:
+            import anthropic
+
+            claude_config = self.config.get('claude', {})
+            api_key = claude_config.get('api_key')
+
+            if not api_key or api_key.startswith('${'):
+                self.logger.warning("Anthropic API key not configured. Claude fallback disabled.")
+                self.claude = None
+                return
+
+            self.claude = anthropic.Anthropic(api_key=api_key)
+            self.claude_model = claude_config.get('model_name', 'claude-opus-4-5-20251101')
+            self.claude_max_tokens = claude_config.get('max_tokens', 4096)
+            self.logger.info(f"Claude initialized with model: {self.claude_model}")
+
+        except ImportError:
+            self.logger.warning("anthropic not available. Install with: pip install anthropic")
+            self.claude = None
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Claude: {e}")
+            self.claude = None
 
     def _init_gemini(self):
         """Initialize Google Gemini API."""
@@ -130,14 +166,35 @@ class OCRAgent(BaseAgent):
             # Try local OCR first
             text, confidence = self._local_ocr(image)
 
-            # Fallback to Gemini if confidence is low
-            if confidence < self.gemini_threshold and self.gemini:
-                self.logger.info(
-                    f"{doc.file_path.name}: Local OCR confidence {confidence:.1f}% < {self.gemini_threshold}%, "
-                    "using Gemini fallback"
-                )
-                text = self._gemini_ocr(image)
-                confidence = 100.0  # Gemini doesn't provide confidence scores
+            # AI fallback chain if confidence is low
+            if confidence < self.claude_threshold:
+                # Try Claude first (better for handwriting)
+                if self.claude:
+                    self.logger.info(
+                        f"{doc.file_path.name}: Local OCR confidence {confidence:.1f}% < {self.claude_threshold}%, "
+                        "using Claude fallback"
+                    )
+                    try:
+                        text = self._claude_ocr(image)
+                        confidence = 95.0  # Claude doesn't provide confidence, assume high
+                        doc.metadata['ocr_method'] = 'claude'
+                    except Exception as e:
+                        self.logger.warning(f"Claude OCR failed: {e}, trying Gemini")
+                        # Fall through to Gemini if Claude fails
+                        if self.gemini and self.gemini_as_backup:
+                            text = self._gemini_ocr(image)
+                            confidence = 90.0
+                            doc.metadata['ocr_method'] = 'gemini_backup'
+
+                # If Claude not available, use Gemini directly
+                elif self.gemini and not self.gemini_as_backup:
+                    self.logger.info(
+                        f"{doc.file_path.name}: Local OCR confidence {confidence:.1f}% < {self.gemini_threshold}%, "
+                        "using Gemini fallback"
+                    )
+                    text = self._gemini_ocr(image)
+                    confidence = 90.0
+                    doc.metadata['ocr_method'] = 'gemini'
 
             doc.content = text
             doc.ocr_confidence = confidence
@@ -261,6 +318,60 @@ class OCRAgent(BaseAgent):
         else:
             self.logger.warning("All local OCR engines failed")
             return "", 0.0
+
+    def _claude_ocr(self, image: Image.Image) -> str:
+        """Perform OCR using Claude Vision API.
+
+        Args:
+            image: PIL Image
+
+        Returns:
+            Extracted text
+        """
+        if not self.claude:
+            raise RuntimeError("Claude not initialized")
+
+        try:
+            import base64
+
+            # Convert PIL Image to base64 format for Claude
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+            image_data = base64.standard_b64encode(img_byte_arr.read()).decode('utf-8')
+
+            # Call Claude API
+            response = self.claude.messages.create(
+                model=self.claude_model,
+                max_tokens=self.claude_max_tokens,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_data
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": self.claude_prompt
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            text = response.content[0].text.strip()
+            self.logger.debug(f"Claude OCR: {len(text)} chars extracted")
+            return text
+
+        except Exception as e:
+            self.logger.error(f"Claude OCR failed: {e}")
+            raise
 
     def _gemini_ocr(self, image: Image.Image) -> str:
         """Perform OCR using Gemini Vision API.

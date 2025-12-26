@@ -5,8 +5,9 @@ pyyaml>=6.0.1
 # Vector database
 chromadb>=0.4.22
 
-# Google Gemini API
-google-generativeai>=0.3.2
+# AI APIs
+google-generativeai>=0.3.2  # Gemini for embeddings and OCR fallback
+anthropic>=0.39.0  # Claude for primary OCR fallback
 
 # OCR engines
 pytesseract>=0.3.10

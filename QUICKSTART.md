@@ -23,17 +23,24 @@ pip install -r requirements.txt
 mkdir -p data/{input,processed,failed,chromadb,logs}
 ```
 
-## Step 2: Configure API Key
+## Step 2: Configure API Keys
 
-Get a free Gemini API key: https://makersuite.google.com/app/apikey
+Get your API keys:
+- **Gemini** (required): https://makersuite.google.com/app/apikey
+- **Anthropic** (optional, for best OCR): https://console.anthropic.com/
 
 ```bash
 # Create .env file
 cp .env.example .env
 
-# Edit .env and add your key
-echo "GEMINI_API_KEY=your_api_key_here" > .env
+# Edit .env and add your keys
+cat > .env << EOF
+GEMINI_API_KEY=your_gemini_key_here
+ANTHROPIC_API_KEY=your_anthropic_key_here  # Optional but recommended for handwriting
+EOF
 ```
+
+**Note**: Claude (Anthropic) provides the best OCR for handwritten documents. Gemini is used as fallback.
 
 ## Step 3: Add Documents
 

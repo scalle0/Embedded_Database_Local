@@ -1,0 +1,129 @@
+# Document Processing System Configuration
+
+# API Keys (set these as environment variables or update here)
+gemini:
+  api_key: ${GEMINI_API_KEY}  # Set via environment variable
+  model_name: "gemini-2.0-flash-exp"  # or gemini-1.5-pro for better quality
+  embedding_model: "models/text-embedding-004"
+  max_retries: 3
+  timeout: 60
+
+# OCR Configuration
+ocr:
+  # Primary OCR engines (local)
+  tesseract:
+    enabled: true
+    language: "nld+eng"  # Dutch + English
+    confidence_threshold: 70  # If below this, use Gemini fallback
+
+  easyocr:
+    enabled: true
+    languages: ["nl", "en"]
+    gpu: false  # Set to true if you have CUDA GPU
+    confidence_threshold: 70
+
+  # Gemini fallback for difficult handwriting
+  gemini_fallback:
+    enabled: true
+    use_when_confidence_below: 70
+    prompt: "Extract all text from this image, including handwritten text. Preserve layout and structure. If text is unclear, indicate with [unclear]."
+
+# Text Extraction
+extraction:
+  pdf:
+    prefer_text_layer: true  # Try text extraction before OCR
+    dpi: 300  # For image-based PDFs
+
+  docx:
+    preserve_formatting: true
+    extract_headers_footers: true
+    extract_comments: true
+
+  email:
+    extract_attachments: true
+    parse_html: true
+    extract_headers: true
+
+# Chunking Strategy
+chunking:
+  strategy: "smart"  # smart, fixed, or sentence
+  chunk_size: 800  # tokens
+  chunk_overlap: 200  # tokens
+  respect_boundaries: true  # Don't split paragraphs
+  min_chunk_size: 100
+  max_chunk_size: 1500
+
+# ChromaDB Configuration
+chromadb:
+  persist_directory: "./data/chromadb"
+  collection_name: "document_embeddings"
+  distance_metric: "cosine"  # cosine, l2, or ip
+
+  # Metadata schema
+  metadata_fields:
+    - source_file
+    - file_type
+    - created_date
+    - modified_date
+    - author
+    - tags
+    - ocr_confidence
+    - page_number
+    - chunk_index
+
+# Processing Pipeline
+pipeline:
+  batch_size: 10  # Documents to process in parallel
+  max_workers: 4  # Concurrent threads
+
+  # File type handlers
+  supported_formats:
+    - .pdf
+    - .docx
+    - .doc
+    - .enex
+    - .eml
+    - .msg
+    - .txt
+    - .md
+    - .png
+    - .jpg
+    - .jpeg
+    - .tiff
+    - .bmp
+
+  # Processing options
+  skip_duplicates: true
+  duplicate_detection: "hash"  # hash or embedding
+
+  # Error handling
+  max_retries: 3
+  continue_on_error: true
+  log_errors: true
+
+# Query Configuration
+query:
+  default_top_k: 10
+  max_top_k: 50
+  similarity_threshold: 0.7
+  enable_reranking: false  # Future: use cross-encoder
+
+  # Hybrid search weights
+  vector_weight: 0.7
+  keyword_weight: 0.3
+
+# Directories
+directories:
+  input: "./data/input"
+  processed: "./data/processed"
+  failed: "./data/failed"
+  logs: "./logs"
+  chromadb: "./data/chromadb"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/pipeline.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5

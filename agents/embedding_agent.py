@@ -4,8 +4,63 @@ import time
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 import hashlib
+from functools import lru_cache
+from collections import OrderedDict
 
 from .base_agent import BaseAgent, DocumentData
+
+
+class LRUCache:
+    """LRU Cache with maximum size limit to prevent memory overflow."""
+
+    def __init__(self, max_size: int = 10000):
+        """Initialize LRU cache.
+
+        Args:
+            max_size: Maximum number of items to cache
+        """
+        self.cache = OrderedDict()
+        self.max_size = max_size
+
+    def get(self, key: str) -> Optional[Any]:
+        """Get item from cache.
+
+        Args:
+            key: Cache key
+
+        Returns:
+            Cached value or None
+        """
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+
+    def put(self, key: str, value: Any):
+        """Put item in cache.
+
+        Args:
+            key: Cache key
+            value: Value to cache
+        """
+        if key in self.cache:
+            # Update existing item
+            self.cache.move_to_end(key)
+        else:
+            # Add new item
+            self.cache[key] = value
+
+            # Evict oldest if over limit
+            if len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
+
+    def __len__(self):
+        return len(self.cache)
+
+    def clear(self):
+        """Clear all cached items."""
+        self.cache.clear()
 
 
 class EmbeddingAgent(BaseAgent):
@@ -29,7 +84,9 @@ class EmbeddingAgent(BaseAgent):
         self._init_gemini_embeddings()
 
         # Embedding cache to avoid reprocessing
-        self.embedding_cache = {}
+        # Use LRU cache with max size to prevent memory overflow
+        cache_size = config.get('embedding', {}).get('cache_size', 10000)
+        self.embedding_cache = LRUCache(max_size=cache_size)
         self.cache_hits = 0
         self.cache_misses = 0
 
@@ -277,8 +334,9 @@ class EmbeddingAgent(BaseAgent):
             for j, text in enumerate(batch):
                 text_hash = self._hash_text(text)
 
-                if text_hash in self.embedding_cache:
-                    batch_embeddings.append(self.embedding_cache[text_hash])
+                cached_embedding = self.embedding_cache.get(text_hash)
+                if cached_embedding is not None:
+                    batch_embeddings.append(cached_embedding)
                     self.cache_hits += 1
                 else:
                     uncached_texts.append(text)
@@ -288,39 +346,68 @@ class EmbeddingAgent(BaseAgent):
 
             # Generate embeddings for uncached texts
             if uncached_texts:
-                try:
-                    # Call Gemini API
-                    result = self.genai.embed_content(
-                        model=self.embedding_model_name,
-                        content=uncached_texts,
-                        task_type="retrieval_document"
-                    )
+                # Retry with exponential backoff
+                max_retries = self.gemini_config.get('max_retries', 3)
+                retry_delay = 1.0
 
-                    # Extract embeddings
-                    new_embeddings = result['embedding'] if len(uncached_texts) == 1 else result['embedding']
+                for retry in range(max_retries):
+                    try:
+                        # Call Gemini API
+                        result = self.genai.embed_content(
+                            model=self.embedding_model_name,
+                            content=uncached_texts,
+                            task_type="retrieval_document"
+                        )
 
-                    # Handle single vs batch response
-                    if len(uncached_texts) == 1:
-                        new_embeddings = [new_embeddings]
+                        # Extract embeddings
+                        new_embeddings = result['embedding'] if len(uncached_texts) == 1 else result['embedding']
 
-                    # Cache and insert embeddings
-                    for text, embedding, idx in zip(uncached_texts, new_embeddings, uncached_indices):
-                        text_hash = self._hash_text(text)
-                        self.embedding_cache[text_hash] = embedding
-                        batch_embeddings[idx] = embedding
+                        # Handle single vs batch response
+                        if len(uncached_texts) == 1:
+                            new_embeddings = [new_embeddings]
 
-                    self.logger.debug(
-                        f"Generated {len(new_embeddings)} embeddings "
-                        f"(cache hits: {self.cache_hits}, misses: {self.cache_misses})"
-                    )
+                        # Cache and insert embeddings
+                        for text, embedding, idx in zip(uncached_texts, new_embeddings, uncached_indices):
+                            text_hash = self._hash_text(text)
+                            self.embedding_cache.put(text_hash, embedding)
+                            batch_embeddings[idx] = embedding
 
-                    # Rate limiting
-                    time.sleep(0.1)  # 10 requests per second max
+                        self.logger.debug(
+                            f"Generated {len(new_embeddings)} embeddings "
+                            f"(cache hits: {self.cache_hits}, misses: {self.cache_misses})"
+                        )
 
-                except Exception as e:
-                    self.logger.error(f"Gemini API error: {e}")
-                    # Return partial results
-                    return all_embeddings
+                        # Rate limiting
+                        time.sleep(0.1)  # 10 requests per second max
+                        break  # Success, exit retry loop
+
+                    except Exception as e:
+                        error_msg = str(e).lower()
+
+                        # Check if it's a rate limit error
+                        if 'rate limit' in error_msg or 'quota' in error_msg or '429' in error_msg:
+                            if retry < max_retries - 1:
+                                self.logger.warning(
+                                    f"Rate limit hit, retrying in {retry_delay}s "
+                                    f"(attempt {retry + 1}/{max_retries})"
+                                )
+                                time.sleep(retry_delay)
+                                retry_delay *= 2  # Exponential backoff
+                                continue
+                            else:
+                                self.logger.error(f"Rate limit exceeded after {max_retries} retries")
+                                return all_embeddings
+                        else:
+                            # Non-rate-limit error
+                            self.logger.error(f"Gemini API error: {e}")
+                            if retry < max_retries - 1:
+                                self.logger.info(f"Retrying... (attempt {retry + 1}/{max_retries})")
+                                time.sleep(retry_delay)
+                                retry_delay *= 2
+                                continue
+                            else:
+                                # Return partial results after all retries
+                                return all_embeddings
 
             all_embeddings.extend(batch_embeddings)
 
@@ -367,8 +454,11 @@ class EmbeddingAgent(BaseAgent):
             import pickle
             cache_file.parent.mkdir(parents=True, exist_ok=True)
 
+            # Convert LRU cache to dict for pickling
+            cache_dict = dict(self.embedding_cache.cache)
+
             with open(cache_file, 'wb') as f:
-                pickle.dump(self.embedding_cache, f)
+                pickle.dump(cache_dict, f)
 
             self.logger.info(f"Saved {len(self.embedding_cache)} cached embeddings to {cache_file}")
 
@@ -392,9 +482,15 @@ class EmbeddingAgent(BaseAgent):
             import pickle
 
             with open(cache_file, 'rb') as f:
-                self.embedding_cache = pickle.load(f)
+                cache_dict = pickle.load(f)
 
-            self.logger.info(f"Loaded {len(self.embedding_cache)} cached embeddings from {cache_file}")
+            # Load into LRU cache (will auto-trim if over max_size)
+            if isinstance(cache_dict, dict):
+                for key, value in cache_dict.items():
+                    self.embedding_cache.put(key, value)
+                self.logger.info(f"Loaded {len(self.embedding_cache)} cached embeddings from {cache_file}")
+            else:
+                self.logger.warning("Cache file format not recognized, starting with empty cache")
 
         except Exception as e:
             self.logger.error(f"Failed to load cache: {e}")

@@ -69,11 +69,16 @@ chunking:
   min_chunk_size: 100
   max_chunk_size: 1500
 
+# Embedding Configuration
+embedding:
+  cache_size: 10000  # Maximum embeddings to cache in memory (LRU)
+
 # ChromaDB Configuration
 chromadb:
   persist_directory: "./data/chromadb"
   collection_name: "document_embeddings"
   distance_metric: "cosine"  # cosine, l2, or ip
+  batch_insert_size: 1000  # Batch size for DB inserts to avoid memory issues
 
   # Metadata schema
   metadata_fields:
@@ -127,6 +132,11 @@ query:
   # Hybrid search weights
   vector_weight: 0.7
   keyword_weight: 0.3
+
+# Memory Management (for large-scale processing)
+memory:
+  max_percent: 80.0  # Maximum system memory usage before triggering cleanup
+  stream_batch_size: 50  # Number of documents to process per batch (reduces memory usage)
 
 # Directories
 directories:

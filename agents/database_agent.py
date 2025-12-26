@@ -117,13 +117,21 @@ class DatabaseAgent(BaseAgent):
 
                 metadatas.append(metadata)
 
-            # Store in ChromaDB
-            self.collection.add(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas
-            )
+            # Store in ChromaDB with batch size limit to avoid memory issues
+            batch_size = self.db_config.get('batch_insert_size', 1000)
+
+            for i in range(0, len(ids), batch_size):
+                batch_ids = ids[i:i + batch_size]
+                batch_embeddings = embeddings[i:i + batch_size]
+                batch_documents = documents[i:i + batch_size]
+                batch_metadatas = metadatas[i:i + batch_size]
+
+                self.collection.add(
+                    ids=batch_ids,
+                    embeddings=batch_embeddings,
+                    documents=batch_documents,
+                    metadatas=batch_metadatas
+                )
 
             # Update document with database IDs
             for chunk, chunk_id in zip(doc.chunks, ids):
@@ -254,17 +262,50 @@ class DatabaseAgent(BaseAgent):
         try:
             total_count = self.collection.count()
 
-            # Get unique source files
-            all_metadata = self.collection.get(include=['metadatas'])
-            source_files = set()
+            # Get unique source files using pagination to avoid memory issues
+            # For large databases (>100k chunks), use sampling instead of loading all
+            if total_count > 100000:
+                # Sample-based estimation for large databases
+                sample_size = min(10000, total_count)
+                sample = self.collection.get(
+                    limit=sample_size,
+                    include=['metadatas']
+                )
+                source_files = set()
+                for metadata in sample['metadatas']:
+                    if 'source_file' in metadata:
+                        source_files.add(metadata['source_file'])
 
-            for metadata in all_metadata['metadatas']:
-                if 'source_file' in metadata:
-                    source_files.add(metadata['source_file'])
+                # Estimate total unique sources (this is an approximation)
+                unique_sources = len(source_files)
+                self.logger.info(
+                    f"Stats based on sample of {sample_size} chunks "
+                    f"(found ~{unique_sources} unique sources)"
+                )
+            else:
+                # For smaller databases, count precisely with pagination
+                source_files = set()
+                offset = 0
+                batch_size = 10000
+
+                while offset < total_count:
+                    batch = self.collection.get(
+                        limit=batch_size,
+                        offset=offset,
+                        include=['metadatas']
+                    )
+
+                    for metadata in batch['metadatas']:
+                        if 'source_file' in metadata:
+                            source_files.add(metadata['source_file'])
+
+                    offset += batch_size
+
+                unique_sources = len(source_files)
 
             stats = {
                 'total_chunks': total_count,
-                'unique_sources': len(source_files),
+                'unique_sources': unique_sources,
                 'collection_name': self.collection.name,
             }
 

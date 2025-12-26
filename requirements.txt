@@ -31,6 +31,7 @@ langchain-text-splitters>=0.0.1  # Smart text chunking
 tqdm>=4.66.1  # Progress bars
 python-magic>=0.4.27  # File type detection
 chardet>=5.2.0  # Character encoding detection
+psutil>=5.9.0  # Memory monitoring
 
 # Async processing
 aiofiles>=23.2.1

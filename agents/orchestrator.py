@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import gc
 
 from .base_agent import BaseAgent, DocumentData
 from .ingestion_agent import IngestionAgent
@@ -11,6 +12,12 @@ from .ocr_agent import OCRAgent
 from .extraction_agent import ExtractionAgent
 from .embedding_agent import EmbeddingAgent
 from .database_agent import DatabaseAgent
+
+# Import memory monitoring and checkpoint utilities
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.memory_monitor import MemoryMonitor
+from utils.checkpoint import CheckpointManager
 
 
 class Orchestrator(BaseAgent):
@@ -41,39 +48,151 @@ class Orchestrator(BaseAgent):
         # Load processed hashes if they exist
         self.ingestion_agent.load_processed_hashes()
 
+        # Initialize memory monitor
+        max_memory = config.get('memory', {}).get('max_percent', 80.0)
+        self.memory_monitor = MemoryMonitor(logger, max_memory_percent=max_memory)
+
+        # Initialize checkpoint manager
+        checkpoint_dir = Path(config.get('directories', {}).get('processed', './data/processed'))
+        checkpoint_file = checkpoint_dir / '.checkpoint.json'
+        self.checkpoint_manager = CheckpointManager(checkpoint_file, logger)
+
+        # Streaming batch size for memory management
+        self.stream_batch_size = config.get('memory', {}).get('stream_batch_size', 50)
+
         self.logger.info("All agents initialized successfully")
 
     def process(
         self,
         input_path: Optional[Path] = None,
-        parallel: bool = True
+        parallel: bool = True,
+        resume: bool = True
     ) -> Dict[str, Any]:
-        """Process documents through the complete pipeline.
+        """Process documents through the complete pipeline with streaming and checkpoints.
 
         Args:
             input_path: Optional specific file/directory to process.
                        If None, uses configured input directory.
             parallel: Whether to use parallel processing
+            resume: Whether to resume from checkpoint if available
 
         Returns:
             Dictionary with processing statistics
         """
         self.logger.info("=" * 80)
-        self.logger.info("Starting document processing pipeline")
+        self.logger.info("Starting document processing pipeline (Streaming Mode)")
         self.logger.info("=" * 80)
+
+        # Log initial memory usage
+        self.memory_monitor.log_memory_usage("startup")
 
         # Step 1: Ingestion
         self.logger.info("\n[1/5] Document Ingestion")
-        documents = self.ingestion_agent.process(input_path)
+        all_documents = self.ingestion_agent.process(input_path)
 
-        if not documents:
+        if not all_documents:
             self.logger.warning("No documents found to process")
             return self._get_final_stats()
 
-        self.logger.info(f"Discovered {len(documents)} documents")
+        self.logger.info(f"Discovered {len(all_documents)} documents")
 
+        # Check for checkpoint and filter already processed files
+        processed_files = []
+        start_batch = 0
+
+        if resume:
+            checkpoint = self.checkpoint_manager.load_checkpoint()
+            if checkpoint:
+                processed_files = checkpoint.get('processed_files', [])
+                start_batch = checkpoint.get('current_batch', 0)
+
+                # Filter out already processed documents
+                processed_paths = set(processed_files)
+                all_documents = [
+                    doc for doc in all_documents
+                    if str(doc.file_path) not in processed_paths
+                ]
+
+                self.logger.info(
+                    f"Resuming from batch {start_batch}: "
+                    f"{len(processed_files)} files already processed, "
+                    f"{len(all_documents)} remaining"
+                )
+
+        # Process in streaming batches to manage memory
+        total_batches = (len(all_documents) + self.stream_batch_size - 1) // self.stream_batch_size
+
+        for batch_idx in range(0, len(all_documents), self.stream_batch_size):
+            current_batch_num = (batch_idx // self.stream_batch_size) + 1 + start_batch
+
+            batch = all_documents[batch_idx:batch_idx + self.stream_batch_size]
+
+            self.logger.info(
+                f"\n{'=' * 80}\n"
+                f"Processing Batch {current_batch_num}/{total_batches + start_batch} "
+                f"({len(batch)} documents)\n"
+                f"{'=' * 80}"
+            )
+
+            # Memory check before processing
+            self.memory_monitor.log_memory_usage(f"batch {current_batch_num} start")
+
+            # Process batch through pipeline
+            batch = self._process_batch(batch, parallel)
+
+            # Save checkpoint after successful batch
+            batch_processed_files = [
+                str(doc.file_path) for doc in batch
+                if doc.processing_status == 'completed'
+            ]
+            processed_files.extend(batch_processed_files)
+
+            self.checkpoint_manager.save_checkpoint(
+                processed_files=processed_files,
+                current_batch=current_batch_num,
+                total_batches=total_batches + start_batch
+            )
+
+            # Clear memory after batch
+            del batch
+            gc.collect()
+
+            self.memory_monitor.log_memory_usage(f"batch {current_batch_num} end")
+
+            # Check memory and force cleanup if needed
+            if not self.memory_monitor.check_memory_usage(force_gc=True):
+                self.logger.warning("High memory usage detected, running aggressive cleanup")
+                self.memory_monitor.clear_memory(aggressive=True)
+
+        # Step 5: Cleanup and Save State
+        self.logger.info("\n[5/5] Cleanup & Saving State")
+        self._cleanup_final()
+
+        # Clear checkpoint after successful completion
+        self.checkpoint_manager.clear_checkpoint()
+
+        # Final statistics
+        stats = self._get_final_stats()
+        self._print_final_report(stats)
+
+        return stats
+
+    def _process_batch(
+        self,
+        documents: List[DocumentData],
+        parallel: bool
+    ) -> List[DocumentData]:
+        """Process a batch of documents through the pipeline.
+
+        Args:
+            documents: List of documents to process
+            parallel: Whether to use parallel processing
+
+        Returns:
+            Processed documents
+        """
         # Step 2: Text Extraction & OCR
-        self.logger.info(f"\n[2/5] Text Extraction & OCR ({len(documents)} documents)")
+        self.logger.info(f"  [2/4] Extracting text from {len(documents)} documents")
 
         if parallel:
             documents = self._parallel_extract(documents)
@@ -81,7 +200,7 @@ class Orchestrator(BaseAgent):
             documents = self._sequential_extract(documents)
 
         # Step 3: Embedding Generation
-        self.logger.info(f"\n[3/5] Embedding Generation ({len(documents)} documents)")
+        self.logger.info(f"  [3/4] Generating embeddings for {len(documents)} documents")
 
         if parallel:
             documents = self._parallel_embed(documents)
@@ -89,22 +208,18 @@ class Orchestrator(BaseAgent):
             documents = self._sequential_embed(documents)
 
         # Step 4: Database Storage
-        self.logger.info(f"\n[4/5] Database Storage ({len(documents)} documents)")
+        self.logger.info(f"  [4/4] Storing {len(documents)} documents in database")
 
         if parallel:
             documents = self._parallel_store(documents)
         else:
             documents = self._sequential_store(documents)
 
-        # Step 5: Cleanup and Save State
-        self.logger.info("\n[5/5] Cleanup & Saving State")
-        self._cleanup(documents)
+        # Save state after each batch
+        self.embedding_agent.save_cache()
+        self.ingestion_agent.save_processed_hashes()
 
-        # Final statistics
-        stats = self._get_final_stats()
-        self._print_final_report(stats)
-
-        return stats
+        return documents
 
     def _sequential_extract(self, documents: List[DocumentData]) -> List[DocumentData]:
         """Extract text from documents sequentially.
@@ -276,45 +391,17 @@ class Orchestrator(BaseAgent):
 
         return processed
 
-    def _cleanup(self, documents: List[DocumentData]):
-        """Cleanup and save state after processing.
-
-        Args:
-            documents: List of processed documents
-        """
+    def _cleanup_final(self):
+        """Final cleanup and save state after all processing."""
         # Save embedding cache
         self.embedding_agent.save_cache()
 
         # Save processed file hashes
         self.ingestion_agent.save_processed_hashes()
 
-        # Move processed files if configured
-        continue_on_error = self.pipeline_config.get('continue_on_error', True)
-
-        if continue_on_error:
-            failed_dir = Path(self.config.get('directories', {}).get('failed', './data/failed'))
-            processed_dir = Path(self.config.get('directories', {}).get('processed', './data/processed'))
-
-            for doc in documents:
-                if doc.processing_status == 'failed':
-                    # Move to failed directory
-                    try:
-                        dest = failed_dir / doc.file_path.name
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        doc.file_path.rename(dest)
-                        self.logger.info(f"Moved failed file to: {dest}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to move {doc.file_path.name}: {e}")
-
-                elif doc.processing_status == 'completed':
-                    # Move to processed directory
-                    try:
-                        dest = processed_dir / doc.file_path.name
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        # Don't move, just log (to avoid losing source files)
-                        self.logger.debug(f"Successfully processed: {doc.file_path.name}")
-                    except Exception as e:
-                        self.logger.error(f"Error handling {doc.file_path.name}: {e}")
+        # Final memory cleanup
+        self.memory_monitor.clear_memory(aggressive=True)
+        self.memory_monitor.log_memory_usage("final cleanup")
 
     def _get_final_stats(self) -> Dict[str, Any]:
         """Get final processing statistics.
